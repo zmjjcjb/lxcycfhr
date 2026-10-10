@@ -1,0 +1,1054 @@
+# 本文件由 launch/iscc_rosman_launch.launch 通过 <rosparam load> 加载到全局参数服务器。
+# 注释依据当前 rosman_iscc/scripts 内的 rospy.get_param/cfg.get 实际读取逻辑。
+# 写有“当前未读取/当前只用于日志”的项，表示配置值存在但当前代码不会用它改变行为。
+
+iscc:
+  # 主控启动时选择状态机入口；iscc_controller.apply_start_stage() 读取。
+  # 可用别名：full/default/all -> 从蓝栏、基地起点开始；
+  # climb -> 等上台阶；
+  # descend -> 等下台阶；
+  # orange/orange_guide -> 等 AprilTag 进橙 A；
+  # sandbag -> 直接从橙线 B + 紫沙包门控开始；
+  # green -> 直接从橙线 B + 绿块门控开始；
+  # green_return_place/return -> 直接从绿块回程放置开始。
+  start_stage: all
+  # 主控调用各任务 /xxx/stop 服务时 rospy.wait_for_service 的等待秒数；超时只记录 warn 并返回失败，不会抛出到主循环。
+  stop_service_timeout: 1.0
+  # 主控调用各任务 /xxx/start 服务时 rospy.wait_for_service 的等待秒数；影响任务切换时最多等多久服务出现。
+  start_service_timeout: 1.0
+  # iscc_controller.run() 启动时先 stop line_follow，再等待这个秒数，然后依次 stop 其他任务，避免服务刚起来时连调太密。
+  startup_run_gap_sec: 0.02
+  # 橙线 B 第一段是否追加紫色沙包检测并允许主控触发 sandbag_throw；sandbag_throw 完成回轨后主控会把它设为 false。
+  sandbag_purple_watch_active: true
+  # 橙线 B 是否追加绿色门控检测并允许主控触发 green_pick；sandbag_throw completed_rejoin 后主控会设为 true，green_pick 完成后设回 false。
+  green_watch_active: false
+
+tasks:
+  # ============================================================
+  # 1. 白线巡线：line_following_node 负责正常巡线；hurdles/climb/descend 节点也复用这里的白线 ROI 和步态。
+  # ============================================================
+  line_following:
+    # ColorDetect 的 line 检测颜色名；line_following/hurdles/climb/descend 都用它发布白线检测参数。
+    color: white
+    # 三段 line ROI，格式 [y_min, y_max, x_min, x_max]，可写比例表达式字符串；分别写入 ColorDetect.line_roi.up/center/down。
+    line_roi:
+      - [5.0 / 12.0, 6.0  / 12.0, 1.0 / 6.0, 5.0 / 6.0]
+      - [6.0 / 12.0, 7.0 / 12.0, 1.0 / 6.0, 5.0 / 6.0]
+      - [7.0 / 12.0, 8.0 / 12.0, 1.0 / 6.0, 5.0 / 6.0]
+    # 巡线时把 line_data.x 相对画面中心的误差乘以该系数，再交给 VisualPatrol.process；hurdles/climb/descend 复用。
+    steering_gain: 2.0
+    # 巡线误差放大后若非零但小于此像素值，会强制抬到此绝对值，用来跨过 VisualPatrol 内部约 10px 死区。
+    patrol_error_floor_px: 12
+
+    # 当前白线巡线步态 profile 名；line_following/hurdles/climb/descend 启动时读取，主控在等橙 A Tag 时会动态改这个参数。
+    gait_profile: default
+    # 主控进入 await_orange_guide 且还没看到 Tag 时，把 gait_profile 切到这个 profile。
+    await_orange_guide_gait_profile: orange_tag_search_fast
+    # 主控 await_orange_guide 第一次看到 Tag 后，把 gait_profile 切到这个更慢的 profile。
+    await_orange_guide_tag_seen_gait_profile: orange_tag_search
+
+    # line_following.configure_line_detection() 是否在白线+蓝栏检测之外，再追加 climb_stairs 的绿色 side 检测，供主控提前看台阶。
+    include_stairs_side: true
+    # 各任务 start 时低头/准备动作之后 sleep 的秒数；line/hurdles/climb/descend/orange_guide/orange_line_follow 都读取。
+    head_settle_sec: 0.01
+    # line_following_node 自动打开 rqt_image_view 时看的图像话题。
+    result_image_topic: "/color_detection/image_result"
+    # true 时 /line_follow/start 会 subprocess 启动 rqt_image_view；false 时不自动开窗口。
+    auto_open_rqt_result: true
+
+    # profile 字段由 apply_gait_profile/apply_line_following_gait_profile 读取；
+    # 底层真实链路是 VisualPatrol.process() -> GaitManager.set_step() -> walking/set_param。
+    # 这组参数的真实映射与有效限制：
+    # - *_x_max -> x_move_amplitude，单位 m，控制“前向步长”，不是周期；本链路经 GaitManager 的有效范围是 [-0.02, 0.02]，巡线通常只写 0~0.02。
+    # - *_dsp -> [period_time_ms, dsp_ratio, y_swap_amplitude_m]，分别控制“周期时间 / 双脚同时着地占比 / 左右换重心摆幅”；
+    #   其中 period_time 代码里只检查 >=0，dsp_ratio 必须在 0~1，y_swap_amplitude 必须在 0~0.05。
+    # - *_arm_swap -> arm_swing_gain，配置单位是度，GaitManager 会转成弧度；有效范围 0~60。
+    # - walking_param_updates / go_walking_param_updates / turn_walking_param_updates 直接覆盖 gait_manager.get_gait_param() 返回字典。
+    #   当前仓库里语义最明确、且本配置实际在用的键：
+    #   body_height -> WalkingParam.init_z_offset，控制站姿/机身基准高度，GaitManager 与控制器层都限制在 0.015~0.06m。
+    #   step_height -> WalkingParam.z_move_amplitude，控制抬脚高度，GaitManager 限 0.01~0.04m，控制器层更宽到 0~0.05m。
+    #   init_y_offset -> WalkingParam.init_y_offset，控制横向站姿偏置；
+    #   init_roll_offset -> WalkingParam.init_roll_offset，控制横滚补偿；
+    #   hip_pitch_offset -> WalkingParam.hip_pitch_offset，控制髋部前后俯仰补偿；
+    #   z_swap_amplitude -> WalkingParam.z_swap_amplitude，控制身体上下起伏幅度，不是左右摆幅；
+    #   pelvis_offset -> WalkingParam.pelvis_offset，控制骨盆摆动/偏置；
+    #   step_fb_ratio -> WalkingParam.step_fb_ratio，底层步态前后比例/反馈参数；除非明确理解算法，否则不建议在 iscc 里随意改。
+    #   注意：通过 set_step() 行走时，真正的前进/侧移/转向量来自 x_max/x_step/y_step/yaw 这些外层参数；
+    #   就算在 walking_param_updates 里写 x_move_amplitude / y_move_amplitude / angle_move_amplitude，也会被 set_step() 的实参覆盖。
+    gait_profiles:
+      default:
+        # 传给 VisualPatrol.update_go_gait(x_max=...)；最终作为 abs(yaw)<3 时的 x_move_amplitude，控制直行前向步长。
+        # 建议写 0~0.02m；超过 0.02m 会被 GaitManager 拒绝，写负值会变成后退巡线。
+        go_x_max: 0.015
+        # 传给 VisualPatrol.update_turn_gait(x_max=...)；最终作为 abs(yaw)>=3 时的 x_move_amplitude，控制“转向时仍保留多少前进步长”。
+        # 建议写 0~0.02m；通常比 go_x_max 更小，用来在拐弯时减速。
+        turn_x_max: 0.010
+        # 直行状态的 step_velocity=[period_time_ms, dsp_ratio, y_swap_amplitude_m]；
+        # 只改节奏/双支撑/左右换重心摆幅，不直接改前向步长。
+        go_dsp: [250, 0.2, 0.023]
+        # 转向状态的 step_velocity；通常把周期调慢一点、或把 dsp_ratio 调高一点来换稳定性。
+        turn_dsp: [280, 0.25, 0.023]
+        # 直行状态的摆臂幅度，单位度；只影响 arm_swing_gain，不直接改腿部步长，GaitManager 有效范围 0~60。
+        go_arm_swap: 30
+        # 转向状态的摆臂幅度，单位度；GaitManager 有效范围 0~60。
+        turn_arm_swap: 22
+        # 同时覆盖 VisualPatrol.go_gait_param 和 turn_gait_param；字段语义与上面的大注释一致。
+        walking_param_updates:
+          # -> WalkingParam.init_z_offset；控制站姿/机身基准高度，不是步长也不是周期。GaitManager 与控制器层都夹到 0.015~0.06m。
+          body_height: 0.025
+          # -> WalkingParam.z_move_amplitude；控制抬脚高度。GaitManager 允许 0.01~0.04m，控制器层更宽到 0~0.05m，但 iscc 这条链路先受 GaitManager 限制。
+          step_height: 0.02
+          # -> WalkingParam.hip_pitch_offset；控制髋部前后俯仰补偿，不是周期/步长。建议只做小幅微调。
+          hip_pitch_offset: 15
+          # -> WalkingParam.z_swap_amplitude；控制身体上下起伏幅度，不是左右摆幅。
+          z_swap_amplitude: 0.006
+          # -> WalkingParam.init_roll_offset；控制横滚补偿。
+          init_roll_offset: 0
+          # -> WalkingParam.init_y_offset；控制横向站姿偏置。
+          init_y_offset: -0.005
+
+      orange_tag_search_fast:
+        # 等橙 A Tag 初期直行时的前向步长；最终发到 x_move_amplitude。建议 0~0.02m。
+        go_x_max: 0.008
+        # 等橙 A Tag 初期转向时保留的前向步长；最终发到 x_move_amplitude。建议 0~0.02m。
+        turn_x_max: 0.008
+        # 等橙 A Tag 初期直行状态的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+        go_dsp: [300, 0.2, 0.023]
+        # 等橙 A Tag 初期转向状态的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+        turn_dsp: [350, 0.25, 0.023]
+        # 等橙 A Tag 初期直行摆臂，单位度，0~60。
+        go_arm_swap: 30
+        # 等橙 A Tag 初期转向摆臂，单位度，0~60。
+        turn_arm_swap: 22
+        # 等橙 A Tag 初期同时覆盖 go/turn 的 gait_param；字段语义和限制同 default。
+        walking_param_updates:
+          # -> WalkingParam.init_z_offset；0.015~0.06m。
+          body_height: 0.025
+          # -> WalkingParam.z_move_amplitude；iscc 这条链路有效 0.01~0.04m。
+          step_height: 0.02
+          # -> WalkingParam.hip_pitch_offset；
+          hip_pitch_offset: 15
+          # -> WalkingParam.z_swap_amplitude；
+          z_swap_amplitude: 0.006
+          # -> WalkingParam.init_roll_offset；
+          init_roll_offset: 0
+          # -> WalkingParam.init_y_offset；
+          init_y_offset: -0.005
+
+      orange_tag_search:
+        # Tag 已经出现后的慢速 profile 直行步长；最终发到 x_move_amplitude。建议 0~0.02m。
+        go_x_max: 0.005
+        # Tag 已经出现后的慢速 profile 转向前向步长；最终发到 x_move_amplitude。建议 0~0.02m。
+        turn_x_max: 0.005
+        # Tag 已经出现后的直行 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+        go_dsp: [350, 0.35, 0.023]
+        # Tag 已经出现后的转向 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+        turn_dsp: [360, 0.35, 0.023]
+        # Tag 已经出现后的直行摆臂，单位度，0~60。
+        go_arm_swap: 10
+        # Tag 已经出现后的转向摆臂，单位度，0~60。
+        turn_arm_swap: 15
+        # Tag 已经出现后同时覆盖 go/turn 的 gait_param；字段语义和限制同 default。
+        walking_param_updates:
+          # -> WalkingParam.init_z_offset；0.015~0.06m。
+          body_height: 0.025
+          # -> WalkingParam.z_move_amplitude；iscc 这条链路有效 0.01~0.04m。
+          step_height: 0.02
+          # -> WalkingParam.hip_pitch_offset；
+          hip_pitch_offset: 15
+          # -> WalkingParam.z_swap_amplitude；
+          z_swap_amplitude: 0.002
+          # -> WalkingParam.init_roll_offset；
+          init_roll_offset: 0
+          # -> WalkingParam.init_y_offset；
+          init_y_offset: -0.005
+
+  # ============================================================
+  # 3. 跨栏：主控先用本节 gate 切入，hurdles_node 内部继续白线巡线，同时看蓝色 side，满足子节点阈值后执行动作组。
+  # ============================================================
+  hurdles:
+    # 蓝栏 side 检测颜色名；line_following 巡线阶段也会用它追加蓝色观察 ROI，供主控 await_blue。
+    color: blue
+    # 蓝栏 side 检测 ROI，格式 [y_min, y_max, x_min, x_max]，乘以 image_processing.process_size 后发给 ColorDetect。
+    roi: [0, 0.9, 0.15, 0.85]
+    gate:
+      # 主控 await_blue 阶段用蓝色 ObjectInfo.y 中心点和这个阈值比较；<=1 时按图像高度比例解释，否则按像素。
+      enter_y_threshold: 320
+    # hurdles_node 子任务内执行跨栏前的 y_max 阈值；<=1 时按 ObjectInfo.height 比例解释，否则按像素。
+    enter_y_threshold: 350
+    # hurdles_node 内 y_max 连续超过 enter_y_threshold 多少帧后执行跨栏动作。
+    y_close_confirm_frames: 1
+    # await_blue 阶段临时收紧白线巡线的 go/turn x_max；最终仍是 VisualPatrol 的 x_move_amplitude，控制“接近蓝栏时的前向步长”。
+    # 建议写 0~0.02m；超过 0.02m 会被 GaitManager 拒绝。
+    slow_gait_x_max: 0.006
+
+    motion:
+      # 真正 run hurdles_action 前，先执行 forward_step_action 的次数。
+      forward_steps_before_hurdles: 0
+      # 真正 run hurdles_action 前，先执行 move_left_action 的次数。
+      move_left_steps_before_hurdles: 0
+      # 真正 run hurdles_action 前，先执行 move_right_action 的次数。
+      move_right_steps_before_hurdles: 1
+      # hurdles_node 激活后连续多少帧看不到蓝栏时，触发一次丢失后退保护。
+      lost_side_frames_before_back_step: 50
+      # 丢失后退保护触发时执行 back_step_action 的次数；为 0 时不会后退。
+      back_step_steps_when_lost: 1
+
+      # 跨栏前先执行的收手动作组名称。
+      hand_back_action: hand_back
+      # 真正跨栏动作组名称。
+      hurdles_action: hurdles
+      # 跨栏完成或丢失后退后恢复站行准备的动作组名称。
+      walk_ready_action: walk_ready
+      # shutdown 时执行的站立动作组名称。
+      stand_action: stand
+      # 执行跨栏前固定步时打印日志用的 phase 字符串，不参与控制。
+      fixed_step_log_phase_before: hurdles_before
+      # 蓝栏丢失后退固定步时打印日志用的 phase 字符串，不参与控制。
+      fixed_step_log_phase_lost_back: hurdles_lost_back_step
+      # 前进固定步动作组名称。
+      forward_step_action: forward_one_step
+      # 左移固定步动作组名称。
+      move_left_action: move_left_iscc
+      # 右移固定步动作组名称。
+      move_right_action: move_right_iscc
+      # 蓝栏丢失后退保护执行的动作组名称。
+      back_step_action: back_step
+      # 两次丢失后退保护之间的最小间隔秒数。
+      back_step_cooldown_sec: 1.0
+
+    # 蓝栏 side ColorDetect 的最小面积过滤值；line_following 追加蓝栏观察和 hurdles_node 都读取。
+    min_area: 10
+    # 蓝栏 y 日志节流秒数；主控 await_blue 和 hurdles_node 内部都读取这个节流。
+    y_log_throttle_sec: 0.2
+
+  # ============================================================
+  # 4. 上台阶：主控先用本节 gate 切入，climb_stairs_node 再用本节阈值决定何时执行动作。
+  # ============================================================
+  climb_stairs:
+    # 上台阶 side 检测颜色；主控 await_stairs_climb、line_following 追加台阶观察、climb_stairs_node 都读取。
+    color: green
+    # 上台阶 side 检测 ROI，格式 [y_min, y_max, x_min, x_max]。
+    roi: [0.2, 1.0, 0.0, 1.0]
+    gate:
+      # 主控 await_stairs_climb 阶段用绿色 side 的 y_max 和这个阈值比较；<=1 时按 ObjectInfo.height 比例解释，否则按像素。
+      enter_y_threshold: 330
+    # climb_stairs_node 子任务内执行 climb_action 前的 y 阈值；<=1 时按 ObjectInfo.height 比例解释，否则按像素。
+    enter_y_threshold: 350
+    # climb_stairs_node 内 y 连续超过 enter_y_threshold 多少帧后执行上台阶。
+    y_close_confirm_frames: 2
+    # await_stairs_climb 阶段临时收紧白线巡线的 go/turn x_max；最终仍是 VisualPatrol 的 x_move_amplitude，控制“接近上台阶前的前向步长”。
+    # 建议写 0~0.02m；超过 0.02m 会被 GaitManager 拒绝。
+    slow_gait_x_max: 0.008
+    # 上台阶完成后，主控进入 await_stairs_descend 前延迟开启下台阶门控的秒数。
+    post_climb_descend_gate_delay_sec: 0.05
+
+    motion:
+      # 执行 climb_action 前先执行 move_left_action 的次数。
+      move_left_steps_before_climb: 0
+      # 执行 climb_action 前先执行 move_right_action 的次数。
+      move_right_steps_before_climb: 1
+      # 执行 climb_action 前先执行 forward_step_action 的次数。
+      forward_steps_before_climb: 1
+      # climb_action 后再执行 move_left_action 的次数。
+      move_left_steps_after_climb: 0
+      # climb_action 后再执行 move_right_action 的次数。
+      move_right_steps_after_climb: 0
+      # climb_action 后再执行 forward_step_action 的次数。
+      forward_steps_after_climb: 0
+
+      # 上台阶前先执行的收手动作组名称。
+      hand_back_action: hand_back
+      # 上台阶完成后恢复准备姿态的动作组名称。
+      walk_ready_action: walk_ready
+      # shutdown 时执行的站立动作组名称。
+      stand_action: stand
+      # 上台阶前固定步日志 phase 字符串。
+      fixed_step_log_phase_before: climb_before
+      # 上台阶后固定步日志 phase 字符串。
+      fixed_step_log_phase_after: climb_after
+      # 前进固定步动作组名称。
+      forward_step_action: forward_one_step
+      # 左移固定步动作组名称。
+      move_left_action: move_left_iscc
+      # 右移固定步动作组名称。
+      move_right_action: move_right_iscc
+      # 真正上台阶动作组名称。
+      climb_action: climb_stairs
+      # 执行 walk_ready_action 后额外等待的秒数。
+      walk_ready_sleep_after_climb: 0.01
+
+    # true 时 climb_stairs_node 用 side 的 max(center_y,left_y,right_y) 和阈值比较；false 时只用 center_y。
+    use_max_y: true
+    # 上台阶 side ColorDetect 的最小面积过滤值；line_following 追加台阶观察和 climb_stairs_node 都读取。
+    min_area: 10
+    # climb_stairs_node 内 y 日志节流秒数。
+    y_log_throttle_sec: 0.2
+
+  # ============================================================
+  # 5. 下台阶：主控先用本节 gate 切入，descend_stairs_node 再用本节阈值决定何时执行动作。
+  # ============================================================
+  descend_stairs:
+    # 下台阶 side 检测颜色；主控 await_stairs_descend 和 descend_stairs_node 读取。
+    color: green
+    # 下台阶 side 检测 ROI，格式 [y_min, y_max, x_min, x_max]。
+    roi: [0.2, 1.0, 0.2, 0.8]
+    gate:
+      # 主控 await_stairs_descend 阶段用绿色 side 的 y_max 和这个阈值比较；<=1 时按 ObjectInfo.height 比例解释，否则按像素。
+      enter_y_threshold: 350
+    # descend_stairs_node 子任务内执行 descend_action 前的 y 阈值；<=1 时按 ObjectInfo.height 比例解释，否则按像素。
+    enter_y_threshold: 350
+    # descend_stairs_node 内 y 连续超过 enter_y_threshold 多少帧后执行下台阶。
+    y_close_confirm_frames: 2
+    # await_stairs_descend 阶段与 descend_stairs_node 接近执行前，都会把 go/turn x_max 锁到这个值；最终仍是 VisualPatrol 的 x_move_amplitude，控制“接近下台阶前的前向步长”。
+    # 建议写 0~0.02m；超过 0.02m 会被 GaitManager 拒绝。
+    slow_gait_x_max: 0.008
+     # 下台阶完成后，主控进入 await_orange_guide 前延迟开启橙 A 门控的秒数。
+
+    motion:
+      # 执行 descend_action 前先执行 move_left_action 的次数。
+      move_left_steps_before_descend: 0
+      # 执行 descend_action 前先执行 move_right_action 的次数。
+      move_right_steps_before_descend: 0
+      # 执行 descend_action 前先执行 forward_step_action 的次数。
+      descend_forward_steps: 1
+
+      # 下台阶完成后恢复准备姿态的动作组名称。
+      walk_ready_action: walk_ready
+      # shutdown 时执行的站立动作组名称。
+      stand_action: stand
+      # 下台阶前固定步日志 phase 字符串。
+      fixed_step_log_phase_before: descend_before
+      # 前进固定步动作组名称。
+      forward_step_action: forward_one_step
+      # 左移固定步动作组名称。
+      move_left_action: move_left_iscc
+      # 右移固定步动作组名称。
+      move_right_action: move_right_iscc
+      # 真正下台阶动作组名称。
+      descend_action: descend_stairs_iscc
+
+    # true 时 descend_stairs_node 用 side 的 max(center_y,left_y,right_y) 和阈值比较；false 时只用 center_y。
+    use_max_y: true
+    # 下台阶 side ColorDetect 的最小面积过滤值。
+    min_area: 10
+    # descend_stairs_node 内 y 日志节流秒数。
+    y_log_throttle_sec: 0.2
+
+  # ============================================================
+  # 6. 橙色 A：主控先在白线阶段用 AprilTag 门控启动 orange_guide_node，orange_guide_node 再用橙色双 side 完成 A。
+  # ============================================================
+  orange_guide:
+    # true 时下台阶标志消失后主控进入 await_orange_guide 等 Tag；false 时下台阶后直接 finished。
+    auto_start_after_descend: true
+    # 橙色 side 检测颜色；orange_guide_node 读取。
+    color: orange
+    tag_trigger:
+      # 主控等待橙 A 入口 Tag 时使用的 AprilTag 中心 ROI，格式 [y_min, y_max, x_min, x_max]，按 frame_width/frame_height 转像素。
+      roi: [0.0, 0.8, 0.3, 0.7]
+      # 主控等待橙 A 入口 Tag 时的中心 y 阈值；<=1 时按 frame_height 比例解释，否则按像素。
+      enter_y_threshold: 50
+      # Tag 中心连续稳定多少帧后允许启动 orange_guide；稳定判断用 image_processing.detection.position_tolerance。
+      stable_frames: 1
+
+      # 是否启用主控的 AprilTag 触发；false 时 await_orange_guide 没有其他 fallback，会一直 warn 等待。
+      enabled: true
+      # 主控订阅的 AprilTagDetectionArray 话题。
+      topic: /tag_detections
+      # 目标 Tag id；-1 表示任意 id 都可触发。
+      target_id: 1
+      # 主控认为 Tag 数据过期的秒数；超过后清空当前 Tag 中心。
+      lost_timeout_sec: 0.5
+      # 主控把 tag_trigger.roi 和比例 enter_y_threshold 转像素时使用的图像宽度。
+      frame_width: 640
+      # 主控把 tag_trigger.roi 和比例 enter_y_threshold 转像素时使用的图像高度。
+      frame_height: 480
+      # 主控 await_orange_guide Tag 日志节流秒数。
+      log_throttle_sec: 0.2
+
+    # orange_guide_node 左橙线 side 检测 ROI，格式 [y_min, y_max, x_min, x_max]。
+    left_roi: [0.5, 1, 0.0, 0.3]
+    # orange_guide_node 右橙线 side 检测 ROI。
+    right_roi: [0.5, 1, 0.7, 1.0]
+    # A 结束门控：左右线都稳定后，还要求右线 y_max >= 此值；0 表示不要求，<=1 时按 ObjectInfo.height 比例解释，否则按像素。
+    right_stop_y_threshold: 280
+    # orange_guide_node 右线 y_max 调试日志节流秒数；右线出现时打印 `og R y_max=当前值/阈值`。
+    right_y_log_throttle_sec: 0.2
+    # orange_guide_node 中左右橙线同时出现连续多少帧后，才允许完成 A 或进入 after_align_forward。
+    both_stable_frames: 1
+
+    # orange_guide 当前只把 x/yaw 暴露到配置里；dsp 在代码里固定为 [320, 0.25, 0.022]，arm_swap 固定 30。
+    # 本字段直接作为 guiding 状态下的 x_move_amplitude，控制持续前进步长；建议写 0~0.02m。
+    guide_linear_x: 0.012
+    # guiding 状态下的 angle_move_amplitude，单位度；控制持续偏航角，不改周期。GaitManager 有效范围 -10~10。
+    guide_yaw: 10
+
+    # 双线稳定并通过右线 y 门控后，额外前进的秒数；0 表示立刻 completed_orange_guide。（用于进入双橙轨道线区域后的调整）
+    after_align_forward_sec: 0
+    # after_align_forward 阶段的 x_move_amplitude，控制附加前进步长；建议写 0~0.02m。
+    after_align_linear_x: 0.004
+    # after_align_forward 阶段的 angle_move_amplitude，单位度；GaitManager 有效范围 -10~10。
+    after_align_yaw: -10
+
+    # orange_guide_node 橙色 side ColorDetect 的最小面积过滤值。
+    min_area: 5
+    # orange_guide_node 周期性重发橙色 side ROI 的秒数；用于覆盖任务切换时可能晚到的空检测配置。
+    detect_refresh_sec: 0.5
+    # orange_guide_node guiding 状态超过该秒数仍未完成时，停止步态并发布 timeout。
+    timeout_sec: 60.0
+
+  # ============================================================
+  # 7. 橙色 B：orange_line_follow_node 根据左右橙色 side 的 x 阈值做简单双线循迹；同时可追加紫色/绿色门控检测。
+  # ============================================================
+  orange_line_following:
+    # B 阶段橙线 side 检测颜色。
+    color: orange
+    # B 阶段左橙线 side 检测 ROI。
+    left_roi: [0.4, 0.8, 0.0, 0.4]
+    # B 阶段右橙线 side 检测 ROI。
+    right_roi: [0.4, 0.8, 0.6, 1.0]
+    # 本段所有运动参数都直接走 OrangeLineFollowNode.apply_motion() -> GaitManager.set_step()。
+    # 真实映射与有效限制：
+    # - *_linear_x / *_x_step -> x_move_amplitude，单位 m，控制前后步长；本链路有效范围 [-0.02, 0.02]。
+    # - side_adjust_linear_y -> y_move_amplitude，单位 m，控制左右横移步长；本链路有效范围 [-0.02, 0.02]。
+    # - *_yaw -> angle_move_amplitude，单位度；本节点会先 clamp 到 [-10, 10]，GaitManager 也要求落在这个范围。
+    # - *_dsp -> [period_time_ms, dsp_ratio, y_swap_amplitude_m]，分别控制周期/双支撑占比/左右换重心摆幅。
+    # - *_arm_swap -> 摆臂幅度，配置单位度，有效 0~60。
+    # - *_walking_param_updates -> 直接覆盖 gait_manager.get_gait_param()；字段语义同 line_following.gait_profiles 上面的说明。
+    # 左右线都不需要调整时向前的 x_move_amplitude；建议写 0~0.02m。
+    go_linear_x: 0.008
+    # B 阶段正常前进时的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]；不直接控制步长。
+    go_dsp: [320, 0.35, 0.023]
+
+    # 最高优先级
+    # 第一层：任一可见线 abs(angle) <= 该角度时，立即原地保护。
+    horizontal_guard_angle_threshold_deg: 40
+    # 横线保护时的 angle_move_amplitude 绝对值；代码会按触发的左右线自动补正负号，并先 clamp 到 0~10。
+    horizontal_guard_yaw: 10
+
+    # 第二优先级
+    # 第二层：任一可见线 abs(angle) <= 该角度时，优先于 x 阈值做近原地角度纠偏。
+    angle_adjust_yaw_threshold_deg: 50
+    # 第二层角度纠偏时附带的 x_move_amplitude；值越小越接近原地转向。建议写 0~0.02m。
+    angle_adjust_linear_x: 0.008
+    # 第二层角度纠偏时的 angle_move_amplitude 绝对值；代码会按左右自动带符号，并先 clamp 到 0~10。
+    angle_adjust_yaw: 5
+
+    # B 阶段第一/第二优先级转向时的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+    turn_dsp: [300, 0.35, 0.023]
+
+    # 第三优先级
+    # 左线 x 超过该值时认为偏左，需要向右纠偏；<=1 按整张处理图宽度比例解释，否则按像素。
+    left_adjust_x_threshold: 200
+    # 右线 x 低于该值时认为偏右，需要向左纠偏；<=1 按整张处理图宽度比例解释，否则按像素。
+    right_adjust_x_threshold: 440
+    # 第三优先级连续侧移时附带的 x_move_amplitude；决定是“原地横移”还是“带一点前进/后退的斜走”。
+    # 本链路有效范围 [-0.02, 0.02]，通常写 0~0.01。
+    side_adjust_linear_x: 0.000
+    # 第三优先级连续侧移时的 y_move_amplitude 绝对值；代码会按左右自动补正负号。
+    # 本链路有效范围 [-0.02, 0.02]，因此这个“基准值”的绝对值也不要超过 0.02m。
+    side_adjust_linear_y: 0.015
+    # 第三优先级连续侧移时的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+    side_adjust_dsp: [300, 0.3, 0.023]
+    # 左右橙线都丢失后的前 grace 秒继续直行，不马上停。
+    lost_both_grace_sec: 0.6
+    # 左右橙线都丢失超过该秒数后停止步态；grace_sec 到 stop_sec 之间仍直行。
+    lost_both_stop_sec: 10.0
+    # B 阶段正常前进时的摆臂幅度，单位度；只影响摆臂，不改腿部步长。有效 0~60。
+    go_arm_swap: 30
+    # B 阶段第一/第二优先级转向时的摆臂幅度，单位度；有效 0~60。
+    turn_arm_swap: 22
+    # 第三优先级连续侧移时的摆臂幅度，单位度；有效 0~60。
+    side_adjust_arm_swap: 22
+
+    # B 阶段橙色 side ColorDetect 的最小面积过滤值。
+    min_area: 10
+    # B 阶段控制日志节流秒数；看到左/右线时简洁打印线位置和本次步态命令。
+    log_xy_throttle_sec: 0.2
+    # /orange_line_follow/status 重复状态发布节流秒数。
+    status_throttle_sec: 0.25
+    # 只覆盖 B 阶段正常前进的 gait_param；字段语义和限制同 line_following.gait_profiles 上面的 walking_param_updates 说明，留空表示不额外覆盖。
+    go_walking_param_updates: {}
+    # 只覆盖 B 阶段转向的 gait_param；留空表示不额外覆盖。
+    turn_walking_param_updates: {}
+    # 只覆盖 B 阶段连续侧移的 gait_param；留空表示不额外覆盖。
+    side_adjust_walking_param_updates: {}
+
+  # ============================================================
+  # 8. 沙包：主控在橙线 B 第一段用紫色门控切入；sandbag_throw_node 负责对齐、捡、找线/Tag、投掷、回轨。
+  # ============================================================
+  sandbag_throw:
+    # false 时主控不触发 sandbag_throw，orange_line_follow 也不会追加紫色 watch 检测；节点 start 也会直接返回 disabled。
+    enabled: true
+    # 紫色沙包检测颜色名；主控门控、orange_line_follow watch、sandbag_throw_node 对齐都读取。
+    color: purple
+    # 紫色沙包检测类型；当前主控门控、调试日志与 sandbag_throw 目标选择统一按中心 y 处理。
+    detect_type: side
+    # 紫色沙包检测 ROI，格式 [y_min, y_max, x_min, x_max]。
+    roi: [0, 1.0, 0.15, 0.85]
+    # 主控橙线 B 第一段触发 sandbag_throw 的紫色中心 y 阈值；<=1 时按 ObjectInfo.height 比例解释，否则按像素。
+    enter_y_threshold: 250
+    # 主控紫色门控需要连续稳定的帧数；稳定判断用 position_tolerance。
+    stability_frames: 1
+    # 主控紫色门控稳定判断的最大曼哈顿位移阈值；abs(dx)+abs(dy) 小于该值才算稳定。
+    position_tolerance: 10
+
+    alignment:
+      # sandbag_throw_node 对齐紫色目标的目标 x；<=1 按 ObjectInfo.width 比例解释，否则按像素。
+      target_x_pixel: 340
+      # sandbag_throw_node 对齐紫色目标中心 y 的目标值；<=1 按 ObjectInfo.height 比例解释，否则按像素。
+      target_y_pixel: 290
+      # 紫色目标 x 目标点额外像素偏移，最终 target_x += offset。
+      target_x_offset: 0
+      # 紫色目标 y 目标点额外像素偏移，最终 target_y += offset。
+      target_y_offset: 0
+      # abs(current_x-target_x) <= 此值且 y 也满足时，认为紫色目标对齐完成并执行 pick。
+      x_tolerance: 30
+      # abs(current_y-target_y) <= 此值且 x 也满足时，认为紫色目标对齐完成并执行 pick。
+      y_tolerance: 10
+      # x 误差进入此范围内后由粗调切到 fine_actions 微调。
+      x_band_px: 40
+      # y 误差进入此范围内后由粗调切到 fine_actions 微调。
+      y_band_px: 40
+      # fine_actions 最多执行次数；超过后发布 fine_tune_exceeded 并停止 active。
+      fine_tune_max_steps: 64
+
+    motion:
+      # 本节所有 x_step / y_step / yaw 都会经 GaitManager.set_step() 变成 x_move_amplitude / y_move_amplitude / angle_move_amplitude。
+      # 有效限制：x/y 在 iscc 这条链路里最终必须落在 [-0.02, 0.02]m；yaw 必须落在 [-10, 10]deg；arm_swap 有效范围 0~60。
+      # *_dsp 的真实格式是 [period_time_ms, dsp_ratio, y_swap_amplitude_m]；其中 period_time 代码只检查 >=0，dsp_ratio 必须 0~1，y_swap_amplitude 必须 0~0.05。
+      # *_walking_param_updates 的字段语义与 line_following.gait_profiles 上面的 walking_param_updates 说明相同。
+      # 粗调时 y 误差超 band 的前后“步长基准”；这个值不会原样下发，
+      # 实际前进发到 x_move_amplitude 的是 +0.7*本值，后退发的是 -0.5*本值。
+      # 为了保证前进实发值不超过 0.02m，建议本值不要超过约 0.028m。
+      coarse_step_distance: 0.020
+      # 粗调时 x 误差超 band 的 angle_move_amplitude 绝对值，单位度；代码会按左右自动补正负号。有效范围 -10~10。
+      coarse_turn_yaw: 8
+      # x 误差已接近 band 边界时使用的较小 angle_move_amplitude 绝对值，单位度；有效范围 -10~10。
+      coarse_fine_yaw: 4
+      # 紫色粗调时的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      coarse_dsp: [320, 0.25, 0.023]
+      # 紫色粗调时的摆臂幅度，单位度；有效 0~60。
+      coarse_arm_swap: 25
+      # 紫色粗调前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      coarse_walking_param_updates: {}
+    fine_actions:
+      # y 误差表示目标偏远时执行的前进一步动作组名称。
+      forward: forward_one_step
+      # y 误差表示目标偏近时执行的后退一步动作组名称。
+      back: back_step
+      # x 误差表示目标偏左时执行的左移动作组名称。
+      move_left: move_left_iscc
+      # x 误差表示目标偏右时执行的右移动作组名称。
+      move_right: move_right_iscc
+    pick:
+      # 紫色目标对齐后执行的捡沙包动作组名称。
+      action_name: pick_sandbag_iscc
+      # pick 动作后等待秒数。
+      wait_sec_after_pick: 0.2
+      # true 时 pick 后执行 walk_ready 动作组。
+      walk_ready_after_pick: true
+
+    post_pick_forward:
+      # pick 后是否先按固定步态向正前方走若干步，再进入盲右转/找线。
+      enabled: true
+      # 固定前进步数；每次 set_step(..., step_num=1)。
+      steps: 5
+      # 每步的 angle_move_amplitude，单位度；控制这几步是否顺带偏航。有效范围 -10~10，纯正前方通常写 0。
+      yaw: 0
+      # 每步的 x_move_amplitude；>0 前进，<0 后退。本链路有效范围 [-0.02, 0.02]m。
+      x_step: 0.020
+      # 每步的 y_move_amplitude；>0 左移，<0 右移。本链路有效范围 [-0.02, 0.02]m；纯正前方通常写 0。
+      y_step: 0.000
+      # 这段固定前进行走使用的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      dsp: [320, 0.3, 0.023]
+      # 这段固定前进行走使用的摆臂幅度，单位度；有效 0~60。
+      arm_swap: 25
+      # 这段固定前进行走前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      walking_param_updates: {}
+
+    post_pick_blind_right:
+      # pick 后是否先进行固定步盲右转，避免刚抓完时旧线/旧 Tag 误判。
+      enabled: true
+      # 盲右转固定步次数；每次 set_step(..., step_num=1)。
+      steps: 1
+      # 盲右转每步的 angle_move_amplitude，单位度；有效范围 -10~10。
+      yaw: -10
+      # 盲右转每步的 x_move_amplitude；>0 前进，<0 后退。本链路有效范围 [-0.02, 0.02]m。
+      x_step: 0.005
+      # 盲右转每步的 y_move_amplitude；>0 左移，<0 右移。本链路有效范围 [-0.02, 0.02]m。
+      # 要“往右前方走”就用 x_step>0 且 y_step<0。
+      y_step: 0.000
+      # 注意：本段当前没有单独的 dsp / arm_swap / walking_param_updates 配置入口；
+      # 代码实际复用 line_align.rotate_dsp / line_align.rotate_arm_swap / line_align.rotate_walking_param_updates。
+
+    line_align:
+      # pick/盲转后是否先用橙色 side 角度对齐；false 时直接进 tag_align 或 throwing。
+      enabled: true
+      # 线对齐阶段检测的颜色名。
+      align_color: orange
+      # 线对齐阶段检测类型。
+      align_detect_type: side
+      # 线对齐阶段检测 ROI。
+      align_roi: [0.0, 0.8, 0.0, 1.0]
+      # 线对齐目标角度；代码用 line_obj.angle - angle_target 算误差。
+      angle_target: 0.0
+      # abs(angle-target) <= 此值时认为线角度已对齐，改为 parallel_search 前进找 Tag。
+      angle_tolerance: 5.0
+      # line_align_right 阶段超时秒数；超时发布 line_align_timeout 并停止 active。
+      timeout_sec: 60
+      # 角度误差 aerr>0 时使用的 angle_move_amplitude，单位度；有效范围 -10~10。
+      right_turn_yaw: -4
+      # 角度误差 aerr<=0 且超容差时使用的 angle_move_amplitude，单位度；有效范围 -10~10。
+      left_backoff_yaw: 4
+      # 右转找线时附带的 x_move_amplitude；左回时代码固定 x_step=0。本链路有效范围 [-0.02, 0.02]m。
+      right_turn_x_step: 0.001
+
+      # 线对齐 ColorDetect 最小面积过滤值。
+      min_area: 5
+      # 线对齐时的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      rotate_dsp: [320, 0.25, 0.023]
+      # 线对齐时的摆臂幅度，单位度；有效 0~60。
+      rotate_arm_swap: 25
+      # line_align_right 阶段相邻两次调整命令的最小开始间隔秒数；0 表示只按单步步态自身节奏运行。
+      min_adjust_interval_sec: 0.6
+      # 线对齐前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      rotate_walking_param_updates: {}
+
+    # line_align/tag_align 搜索阶段没看到线或已平行时，用这个 x_move_amplitude 继续前进找 Tag。
+    # 本链路有效范围 [-0.02, 0.02]m。
+    search_forward_x_step: 0.005
+
+    tag_align:
+      # Tag 对齐阶段接收 AprilTag 后保留的中心 ROI，格式 [y_min, y_max, x_min, x_max]，按 frame_width/frame_height 转像素。
+      roi: [0.0, 0.8, 0.2, 0.8]
+      # Tag 对齐目标 x；<=1 按 tag_frame_width 比例解释，否则按像素。
+      target_x_pixel: 350
+      # Tag 对齐目标 y；<=1 按 tag_frame_height 比例解释，否则按像素。
+      target_y_pixel: 100
+      # abs(tag_x-target_x) <= 此值且 y 也满足时累计 tag_stable_count。
+      x_tolerance: 80
+      # abs(tag_y-target_y) <= 此值且 x 也满足时累计 tag_stable_count。
+      y_tolerance: 80
+      # Tag 在 line_align 阶段连续可见多少次后，立即切到 tag_align。
+      switch_stable_frames: 1
+      # Tag 对齐时前后“步长基准”；不会原样下发，实际前进发 +0.7*本值，后退发 -0.5*本值到 x_move_amplitude。
+      # 为了保证前进实发值不超过 0.02m，建议本值不要超过约 0.028m。
+      coarse_step_distance: 0.020
+      # Tag 左右偏差时使用的 y_move_amplitude 绝对值；图像里 Tag 偏右则右移，偏左则左移。
+      # 本链路有效范围 [-0.02, 0.02]m。
+      coarse_side_step_distance: 0.015
+
+      # 是否启用 Tag 对齐；false 时 line_align 后会直接 throw 或 done。
+      enabled: true
+      # sandbag_throw_node 订阅的 AprilTagDetectionArray 话题。
+      topic: /tag_detections
+      # 目标 Tag id；-1 则表示任意 id。
+      target_id: 1
+      # Tag x/y 同时进入容差后，连续多少帧才认为 tag_aligned 并进入 throw。
+      stable_frames: 1
+      # tag_align 阶段超时秒数；超时发布 tag_align_timeout 并停止 active。
+      timeout_sec: 60.0
+      # Tag 数据过期秒数；过期后清空 Tag，并回到 line_align 或前进搜索。
+      lost_timeout_sec: 2.0
+      # Tag 对齐时的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      coarse_dsp: [320, 0.25, 0.023]
+      # Tag 对齐时的摆臂幅度，单位度；有效 0~60。
+      coarse_arm_swap: 25
+      # tag_align 阶段相邻两次调整命令的最小开始间隔秒数；0 表示只按单步步态自身节奏运行。
+      min_adjust_interval_sec: 0.6
+      # Tag 对齐前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      coarse_walking_param_updates: {}
+
+    throw:
+      # 是否执行投掷动作；false 时 tag_aligned 后直接 done。
+      enabled: true
+      # 投掷动作组名称。
+      action_name: throw_sandbag_iscc
+      # 投掷动作后等待秒数。
+      wait_sec_after_throw: 0.5
+      # true 时投掷后执行 walk_ready 动作组。
+      walk_ready_after_throw: true
+
+    rejoin_left:
+      # 投掷后是否左转回橙线；false 时投掷后 done 并停止检测。
+      enabled: true
+      # 回轨阶段左线检测颜色名。
+      left_color: orange
+      # 回轨阶段左线检测类型。
+      left_detect_type: side
+      # 回轨阶段左线检测 ROI。（建议往左缩小一些，保证不会误识别）
+      left_roi: [0.4, 1.0, 0.0, 0.2]
+      # 回轨阶段右线检测颜色名。
+      right_color: orange
+      # 回轨阶段右线检测类型。
+      right_detect_type: side
+      # 回轨阶段右线检测 ROI。（建议往右缩小一些，保证不会误识别））
+      right_roi: [0.4, 1.0, 0.8, 1.0]
+      # 回轨前先盲左转的固定步次数，防止刚转身横线误判回轨成功。
+      blind_turn_steps: 4
+      # 盲左转每步的 angle_move_amplitude，单位度；有效范围 -10~10。
+      blind_turn_yaw: 8
+      # 盲左转每步的 x_move_amplitude；本链路有效范围 [-0.02, 0.02]m。
+      blind_turn_x_step: 0.000
+      # 盲转结束后持续找双线时的 angle_move_amplitude，单位度；有效范围 -10~10。
+      left_turn_yaw: 4
+      # 盲转结束后持续找双线时的 x_move_amplitude；本链路有效范围 [-0.02, 0.02]m。
+      left_turn_x_step: 0.000
+      # 双线 lane_ok 连续多少帧后发布 completed_rejoin。
+      stable_frames: 1
+      # rejoin_left 阶段超时秒数；超时发布 rejoin_timeout 并停止 active。
+      timeout_sec: 60.0
+      # 左右线缺任一条连续多少帧后发布 rejoin_searching；主要影响状态，不直接停。
+      lost_frames_to_search: 10
+      # 回轨成功判据：右线 x - 左线 x 必须 >= 此宽度；gait_switch=false 手动摆位调试时建议重点观察/调整。
+      min_lane_width_px: 40
+      # 回轨成功判据：右线 x - 左线 x 必须 <= 此宽度；日志会一起打印当前 lane_width 和该上限。
+      max_lane_width_px: 600
+      # true 时要求 left_x < right_x；false 时只看 lane_width 范围。
+      require_left_right_order: true
+      # 额外 handoff 条件：回轨阶段如果已经看到绿色块在画面中间或右边，也认为可以切回双线循迹。
+      green_handoff_enabled: true
+      # 绿色 handoff 检测颜色名。
+      green_color: green_pick
+      # 绿色 handoff 检测类型。
+      green_detect_type: side
+      # 绿色 handoff 检测 ROI。
+      green_roi: [0, 0.8, 0.15, 0.85]
+      # 绿色 handoff ColorDetect 最小面积。
+      green_min_area: 5
+      # 绿色块中心 x >= 此阈值就算“在中间或右边”；<=1 时按画面宽度比例解释，否则按像素。
+      green_min_x: 0.5
+      # 绿色 handoff 连续满足多少帧后发布 completed_rejoin。
+      green_stable_frames: 1
+
+      # 回轨左右线 ColorDetect 最小面积过滤值。
+      min_area: 10
+      # 回轨日志节流秒数。
+      log_throttle_sec: 0.2
+      # 回轨阶段的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      rotate_dsp: [320, 0.25, 0.023]
+      # 回轨阶段的摆臂幅度，单位度；有效 0~60。
+      rotate_arm_swap: 25
+      # 回轨阶段前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      rotate_walking_param_updates: {}
+
+    # 紫色 ColorDetect 最小面积过滤值；主控/橙线 watch/沙包节点都会读取。
+    min_area: 10
+    # 紫色 y 调试日志节流秒数；主控和 orange_line_follow 紫色 tune 日志读取。
+    y_log_throttle_sec: 0.2
+    # sandbag_throw_node run 循环的总对齐超时；_start_time 在阶段切换时会重置，所以不只影响最初紫色对齐。
+    align_timeout_sec: 60.0
+    # 初始紫色对齐阶段连续丢失目标多少帧后发布 searching。
+    lost_frames_to_search: 10
+    # sandbag_throw_node 紫色/线/Tag 对齐日志节流秒数。
+    align_log_throttle_sec: 0.2
+
+  # ============================================================
+  # 9. 绿块门控：sandbag_throw completed_rejoin 后，主控打开 green_watch_active；orange_line_follow 追加绿块检测，主控触发 green_pick。
+  # ============================================================
+  green_pick_gate:
+    # false 时主控不触发 green_pick，osrange_line_follow 也不会追加绿色 watch 检测。
+    enabled: true
+    # 绿色门控检测颜色名。
+    color: green_pick
+    # 绿色门控检测类型；主控按该 type 和 color 从 /object/pixel_coords 里选目标。
+    detect_type: side
+    # 绿色门控检测 ROI。
+    roi: [0.2, 1.0, 0.15, 0.85]
+    # 主控触发 green_pick 的绿色中心 y 阈值；<=1 时按 ObjectInfo.height 比例解释，否则按像素。
+    enter_y_threshold: 240
+    # 主控绿色门控需要连续稳定的帧数。
+    stability_frames: 1
+    # 主控绿色门控稳定判断的最大曼哈顿位移阈值。
+    position_tolerance: 10
+
+    # 绿色门控 ColorDetect 最小面积过滤值；orange_line_follow 追加绿色 watch 检测时读取。
+    min_area: 1
+    # 绿色门控 y 调试日志节流秒数；主控和 orange_line_follow 绿色 tune 日志读取。
+    y_log_throttle_sec: 0.2
+
+  # ============================================================
+  # 10. 绿块抓取：green_pick_node 只负责对齐绿色目标并执行 pick，完成后主控停掉 green_pick。
+  # ============================================================
+  green_pick:
+    # false 时 /green_pick/start 直接返回 disabled。
+    enabled: true
+    # green_pick_node 对齐抓取时检测的颜色名。
+    color: green_pick
+    # green_pick_node 对齐抓取时检测类型。
+    detect_type: side
+    # green_pick_node 对齐抓取时的检测 ROI。
+    roi: [0.2, 1.0, 0.15, 0.85]
+
+    alignment:
+      # green_pick 对齐目标 x；<=1 按 ObjectInfo.width 比例解释，否则按像素。
+      target_x_pixel: 380
+      # green_pick 对齐绿色目标中心 y 的目标值；<=1 按 ObjectInfo.height 比例解释，否则按像素。
+      target_y_pixel: 325
+      # 绿色目标 x 目标点额外像素偏移。
+      target_x_offset: 0
+      # 绿色目标 y 目标点额外像素偏移。
+      target_y_offset: 0
+      # abs(current_x-target_x) <= 此值且 y 也满足时执行 pick。
+      x_tolerance: 10
+      # abs(current_y-target_y) <= 此值且 x 也满足时执行 pick。
+      y_tolerance: 10
+      # x 误差进入此范围内后由粗调切到 fine_actions 微调。
+      x_band_px: 40
+      # y 误差进入此范围内后由粗调切到 fine_actions 微调。
+      y_band_px: 40
+      # fine_actions 最多执行次数；超过后发布 fine_tune_exceeded 并停止 active。
+      fine_tune_max_steps: 64
+
+    motion:
+      # 本节的 x_step / yaw 都直接经 GaitManager.set_step() 发到底层。
+      # 有效限制：x/y 在 iscc 这条链路里最终必须落在 [-0.02, 0.02]m；yaw 必须落在 [-10, 10]deg；arm_swap 有效范围 0~60。
+      # *_dsp 的真实格式是 [period_time_ms, dsp_ratio, y_swap_amplitude_m]；其中 period_time 代码只检查 >=0，dsp_ratio 必须 0~1，y_swap_amplitude 必须 0~0.05。
+      # *_walking_param_updates 的字段语义与 line_following.gait_profiles 上面的 walking_param_updates 说明相同。
+      # green_pick 粗调时前后“步长基准”；不会原样下发，实际前进发 +0.7*本值，后退发 -0.5*本值到 x_move_amplitude。
+      # 为了保证前进实发值不超过 0.02m，建议本值不要超过约 0.028m。
+      coarse_step_distance: 0.020
+      # green_pick 粗调时 x 误差超 band 的 angle_move_amplitude 绝对值，单位度；代码会按左右自动补正负号。有效范围 -10~10。
+      coarse_turn_yaw: 8
+      # green_pick x 误差接近 band 边界时使用的较小 angle_move_amplitude 绝对值，单位度；有效范围 -10~10。
+      coarse_fine_yaw: 4
+      # green_pick 粗调时的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      coarse_dsp: [320, 0.25, 0.023]
+      # green_pick 粗调时的摆臂幅度，单位度；有效 0~60。
+      coarse_arm_swap: 25
+      # green_pick 粗调前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      coarse_walking_param_updates: {}
+    fine_actions:
+      # y 误差表示目标偏远时执行的前进一步动作组名称。
+      forward: forward_one_step
+      # y 误差表示目标偏近时执行的后退一步动作组名称。
+      back: back_step
+      # x 误差表示目标偏左时执行的左移动作组名称。
+      move_left: move_left_iscc
+      # x 误差表示目标偏右时执行的右移动作组名称。
+      move_right: move_right_iscc
+    pick:
+      # 绿色目标对齐后执行的抓取动作组名称。
+      action_name: pick_green_iscc
+      # pick 动作后等待秒数。
+      wait_sec_after_pick: 1.0
+      # true 时 pick 后执行 walk_ready 动作组。
+      walk_ready_after_pick: true
+
+    # /green_pick/start 时打印到日志的提示文字。
+    placeholder_message: 进入green_pick阶段
+    # green_pick ColorDetect 最小面积过滤值。
+    min_area: 10
+    # green_pick 对齐阶段超时秒数；只在 aligning/coarse_align/fine_align 阶段触发。
+    align_timeout_sec: 60.0
+    # green_pick 对齐阶段连续丢失目标多少帧后发布 searching。
+    lost_frames_to_search: 10
+    # green_pick x/y 对齐日志节流秒数。
+    align_log_throttle_sec: 0.2
+
+  # ============================================================
+  # 11. 绿块后回程放块：green_pick 完成后切入，右转找回橙色双线，直到看见 Tag 后放块。
+  # ============================================================
+  green_return_place:
+    # false 时 /green_return_place/start 直接返回 disabled。
+    enabled: true
+    # 回程阶段使用的橙线颜色。
+    color: orange
+
+    post_pick_blind_right:
+      # 回程启动后先固定盲右转若干步，把右侧橙线先转进视野里，再进入 line_align。
+      enabled: true
+      # 固定步次数；每次 set_step(..., step_num=1)。
+      steps: 2
+      # 每步的 angle_move_amplitude，单位度；有效范围 -10~10。
+      yaw: -10
+      # 每步附带的 x_move_amplitude；>0 前进，<0 后退。本链路有效范围 [-0.02, 0.02]m。
+      x_step: 0.001
+      # 固定盲右转使用的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      dsp: [350, 0.35, 0.023]
+      # 固定盲右转使用的摆臂幅度，单位度；有效 0~60。
+      arm_swap: 25
+      # 固定盲右转前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      walking_param_updates: {}
+
+    line_align:
+      # 掉头前先对右侧橙线做平行对齐。
+      align_color: orange
+      align_detect_type: side
+      align_roi: [0.0, 0.8, 0.2, 1.0]
+      # 裁掉左半边一部分，避免误识别；同时保留右侧全宽增加鲁棒性。
+      min_area: 5.0
+      # 目标是当前看到的右侧橙线 angle 接近水平。
+      angle_target: 0.0
+      angle_tolerance: 5.0
+      stable_frames: 2
+      timeout_sec: 20.0
+      lost_frames_to_search: 8
+      # 看不到合适线时持续右转搜索；角度过头时允许小幅左回。
+      # right_turn_yaw / left_backoff_yaw 都是 angle_move_amplitude，单位度；有效范围 -10~10。
+      right_turn_yaw: -6
+      left_backoff_yaw: 5
+      # 右转搜索时附带的 x_move_amplitude；左回时代码会把 x_step 置 0。本链路有效范围 [-0.02, 0.02]m。
+      right_turn_x_step: 0.001
+      # 暂时看不到线时持续搜索用的 x_move_amplitude。本链路有效范围 [-0.02, 0.02]m。
+      search_x_step: 0.005
+      # 线对齐阶段的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      rotate_dsp: [320, 0.25, 0.023]
+      # 线对齐阶段的摆臂幅度，单位度；有效 0~60。
+      rotate_arm_swap: 25
+      # 线对齐阶段前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      rotate_walking_param_updates: {}
+
+    blind_turn:
+      # 平行对齐后固定右转若干步，完成接近 180 度掉头的中段动作。
+      steps: 3
+      # 每步的 angle_move_amplitude，单位度；有效范围 -10~10。
+      yaw: -10
+      # 每步附带的 x_move_amplitude。本链路有效范围 [-0.02, 0.02]m。
+      x_step: 0.000
+      # 掉头中段固定步使用的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      dsp: [350, 0.35, 0.023]
+      # 掉头中段固定步的摆臂幅度，单位度；有效 0~60。
+      arm_swap: 25
+      # 掉头中段固定步前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      walking_param_updates: {}
+
+    lane_search:
+      # 掉头后继续右转找回双橙线轨道。
+      left_color: orange
+      left_detect_type: side
+      left_roi: [0.4, 0.8, 0.0, 0.4]
+      right_color: orange
+      right_detect_type: side
+      right_roi: [0.4, 0.8, 0.6, 1.0]
+      min_area: 5
+      # 掉头后找回双橙线时的 angle_move_amplitude，单位度；有效范围 -10~10。
+      turn_yaw: -5
+      # 掉头后找回双橙线时附带的 x_move_amplitude。本链路有效范围 [-0.02, 0.02]m。
+      turn_x_step: 0.005
+      stable_frames: 1
+      timeout_sec: 60.0
+      lost_frames_to_search: 8
+      # 双线判据：left_x < right_x 且 lane_width 落在这个范围内；gait_switch=false 手动摆位调试时建议重点观察/调整。
+      min_lane_width_px: 40
+      max_lane_width_px: 600
+      require_left_right_order: true
+      # lane_search 阶段的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      rotate_dsp: [350, 0.35, 0.023]
+      # lane_search 阶段的摆臂幅度，单位度；有效 0~60。
+      rotate_arm_swap: 25
+      # lane_search 阶段前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      rotate_walking_param_updates: {}
+
+    corridor_follow:
+      # 找到双线后复用 /orange_line_follow。
+      start_service: /orange_line_follow/start
+      stop_service: /orange_line_follow/stop
+      # orange_line_follow 连续进入这些状态后，切到 terminal_scan。
+      lost_statuses: [lost_both_straight, lost_both_stopped]
+      lost_status_min_sec: 0.4
+      # 0 表示不单独限制 corridor_follow 时间。
+      timeout_sec: 0.0
+
+    tag_trigger:
+      # 终点标记使用 AprilTag 检测；本节只负责“看见/丢失 Tag”的公共检测参数。
+      enabled: true
+      topic: /tag_detections
+      # -1 则表示任意 id。
+      target_id: 1
+      # 终点 Tag 检测 ROI；按 frame_width/frame_height 转像素。
+      roi: [0.0, 1.0, 0.0, 1.0]
+      frame_width: 640
+      frame_height: 480
+      # Tag 数据超过这个时长没更新就认为已丢失。
+      lost_timeout_sec: 1.0
+      log_throttle_sec: 0.2
+
+    tag_approach:
+      # terminal_scan 中 Tag 连续可见多少帧后，切入 tag_approach。
+      switch_visible_stable_frames: 2
+      # 进入 tag_approach 后希望把 Tag 中心保持在画面中间附近。
+      target_x_pixel: 0.5
+      # abs(tag_x-target_x) 超过该带宽时，开始加 yaw 居中。
+      x_band_px: 40
+      # Tag 明显偏离中心时使用的较大 angle_move_amplitude 绝对值，单位度；代码会按左右自动补正负号。有效范围 -10~10。
+      coarse_turn_yaw: 5
+      # Tag 接近中心但还没进带宽时使用的小 angle_move_amplitude 绝对值，单位度；代码会按左右自动补正负号。有效范围 -10~10。
+      fine_turn_yaw: 5
+      # tag_approach 持续前进时的 x_move_amplitude；控制慢速逼近步长。本链路有效范围 [-0.02, 0.02]m。
+      forward_x_step: 0.005
+      # Tag 中心 y 达到该阈值并连续 2 帧后，切到 tag_align；<=1 时按 frame_height 比例解释，否则按像素。
+      pre_align_y_threshold: 240
+      # tag_approach 阶段的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      dsp: [350, 0.35, 0.023]
+      # tag_approach 阶段的摆臂幅度，单位度；有效 0~60。
+      arm_swap: 25
+      # tag_approach 阶段前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      walking_param_updates: {}
+
+    tag_align:
+      # 近距离精对齐目标中心；x<=1 按 frame_width 比例解释，y<=1 按 frame_height 比例解释。
+      target_x_pixel: 0.5
+      target_y_pixel: 250
+      # x/y 同时进入容差并连续 stable_frames 帧后才允许放块。
+      x_tolerance: 60
+      y_tolerance: 60
+      stable_frames: 1
+      # y 轴误差对应前后“步长基准”，x 轴误差对应横移步长基准。
+      # coarse_step_distance 实际前进发 +0.7*本值、后退发 -0.5*本值到 x_move_amplitude；建议本值不要超过约 0.028m。
+      coarse_step_distance: 0.005
+      # coarse_side_step_distance 直接作为 y_move_amplitude 绝对值使用；本链路有效范围 [-0.02, 0.02]m。
+      coarse_side_step_distance: 0.005
+      # tag_align 阶段的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      dsp: [350, 0.35, 0.023]
+      # tag_align 阶段的摆臂幅度，单位度；有效 0~60。
+      arm_swap: 25
+      # 未配置时默认复用 tag_trigger.lost_timeout_sec。
+      lost_timeout_sec: 1.0
+      # tag_align 阶段前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      walking_param_updates: {}
+
+    terminal_scan:
+      # 双线丢失后放慢步伐，继续直行扫描终点 Tag，同时继续看双橙线是否恢复。
+      # 如果 Tag 连续可见，会从这里切到 tag_approach；如果双线重新满足判据，仍可回到 corridor_follow。
+      # terminal_scan 持续扫描时的 x_move_amplitude；控制慢速直行步长。本链路有效范围 [-0.02, 0.02]m。
+      x_step: 0.010
+      # terminal_scan 持续扫描时的 angle_move_amplitude，单位度；有效范围 -10~10。
+      yaw: 0
+      # terminal_scan 阶段的 [period_time_ms, dsp_ratio, y_swap_amplitude_m]。
+      dsp: [350, 0.35, 0.023]
+      # terminal_scan 阶段的摆臂幅度，单位度；有效 0~60。
+      arm_swap: 25
+      timeout_sec: 60.0
+      log_throttle_sec: 0.2
+      # terminal_scan 中双橙线重新满足 lane_search 判据多少帧后，重新切回 orange_line_follow 循迹。
+      reacquire_lane_stable_frames: 2
+      # terminal_scan 阶段前覆盖的 gait_param；字段语义/限制同 line_following.gait_profiles 上面的 walking_param_updates 说明。
+      walking_param_updates: {}
+
+    place:
+      action_name: place_green_iscc
+      wait_sec_after_place: 0.2
+      walk_ready_after_place: true
+
+    # 回程日志节流秒数。
+    log_throttle_sec: 0.2
+
+# ============================================================
+# 公共区：图像处理尺寸、主控稳定判据、舵机初始位置。
+# ============================================================
+image_processing:
+  detection:
+    # 主控稳定判据的默认帧数：蓝栏和橙 A Tag 使用；紫色/绿色门控若没单独配置也会回退到这里。
+    stability_frames: 3
+    # 主控稳定判据的默认位置容差：历史点之间 abs(dx)+abs(dy) 必须小于该值；紫色/绿色门控可单独覆盖。
+    position_tolerance: 10
+  # 各任务发布 ColorDetect.image_process_size 时使用；color_detection.py 会把图像缩到该尺寸检测，再把坐标映射回原图。
+  process_size: [160, 120]
+
+servo:
+  # Common 初始化和 set_servo 时使用的头部水平舵机初始值；代码里舵机 id 23 使用该值。
+  head_pan_init: 500
+  # 各任务 start 时低头看的俯仰舵机值；代码里舵机 id 24 使用该值。
+  head_tilt_look_down: 280

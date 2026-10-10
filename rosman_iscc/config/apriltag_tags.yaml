@@ -1,0 +1,31 @@
+# AprilTag 检测目标定义
+# 这个文件主要告诉 apriltag_ros：
+# 1. 哪些 Tag id 是合法目标
+# 2. 每个 Tag 的实际物理尺寸是多少
+#
+# 注意：
+# - 这里配错 size，一般不会让 2D 检测“完全看不到 Tag”，
+#   但会影响位姿、距离、TF 尺度是否准确。
+# - 如果只是想提升“识别速度/更快出结果”，优先改 apriltag_settings.yaml，
+#   而不是这里。
+# - 单位都是米；size 表示 Tag 黑白边界外框的实际边长。
+
+# 单个独立 Tag 列表。
+# 每一项含义：
+# - id: Tag 的编码 id，必须和场上实际打印的 Tag 一致
+# - size: 这个 Tag 的实际边长（米）
+# - name: 发布检测结果/TF 时更易读的名字
+standalone_tags:
+  [
+    {id: 0, size: 0.1, name: throw_zone_0},
+    {id: 1, size: 0.1, name: throw_zone_1},
+    {id: 2, size: 0.1, name: throw_zone_2},
+    {id: 3, size: 0.1, name: throw_zone_3}
+  ]
+
+# Tag 刚性组合（bundle）定义。
+# 只有当多个 Tag 固定安装在同一个刚体上、并且需要联合求位姿时才用这里。
+# 当前 ISCC 功能包没有用 bundle，所以保持空列表即可。
+tag_bundles:
+  [
+  ]

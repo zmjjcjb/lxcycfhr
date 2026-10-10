@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="master"      default="$(env MASTER_NAME)"/>
+    <arg name="robot_name"  default="$(env ROBOT_NAME)"/>
+
+    <node if="$(eval master == robot_name)" name="joystick" pkg="joy" type="joy_node" output="screen">
+        <param name="dev" type="string" value="/dev/input/js0"/>
+        <param name="autorepeat_rate"   type="double" value="20.0"/>
+        <param name="coalesce_interval" type="double" value="0.05"/>
+    </node>
+
+    <group ns="$(arg robot_name)">
+        <include file="$(find rosman_kinematics)/launch/rosman_controller.launch"/>
+        <node name="joystick_control" pkg="rosman_peripherals" type="joystick_control.py" output="screen">
+            <param name="joy" type="string" value="/joy"/>
+        </node>
+    </group>
+</launch>

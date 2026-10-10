@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+# encoding: utf-8
+# @data:2023/07/11
+# @author:aiden
+# 接近物体逻辑处理
+import math
+from rosman_sdk import misc, common
+from rosman_example import gait_posture
+
+class ApproachObject:
+    def __init__(self, gait_manager, step_mode=1, debug=False):
+        self.calib_config = common.get_yaml_data('/home/ubuntu/ros_ws/src/rosman_example/config/calib.yaml')
+        self.debug = debug
+        self.count_stop = 0
+        self.stop_count = 0
+        self.max_process_count = 40  # 接近阶段调用次数封顶，0.8s/次 ≈ 32s（远距起步约需 25 步）
+        # 09-24 实测：init_x_offset=0.0 后 ±0.01 会原地倒腿（09-23 矩阵同结论），
+        # 提到 ±0.02（与巡线一致、已验证"前进且不栽"）
+        self.x_range = [-0.02, 0.02]  # 前进脚步大小单位m
+        self.y_range = [-0.01, 0.01]  # 前进脚步大小单位m
+        self.yaw_range = [-8, 8]  # 转弯范围正负10度
+        self.gait_manager = gait_manager
+        # 姿态取自 gait_posture 的 APPROACH 一组（= 本次改动之前的原值），
+        # 目的是让"能不能走"这个基线测试不被我改过的参数污染
+        self.gait_param = gait_posture.build_approach(gait_manager)
+        self.dsp = list(gait_posture.APPROACH_DSP)
+        self.arm_swap = 0  # 接近物体时不摆臂，保持原有姿态
+
+        self.x_approach_value = 50 
+        self.y_approach_value = 40
+        self.yaw_approach_value = 7
+
+        self.step_mode = step_mode
+        
+    def update_stop_count(self, num):
+        self.stop_count = num
+
+    def update_gait(self, dsp=None, arm_swap=None, walking_param=None, step_mode=None):
+        if walking_param is not None:
+            self.gait_param = walking_param
+        if step_mode is not None:
+            self.step_mode = step_mode
+        if dsp is not None:
+            self.dsp = dsp
+        if arm_swap is not None:
+            self.arm_swap = arm_swap
+
+    def update_gait_range(self, x_range=None, y_range=None, yaw_range=None):
+        if x_range is not None:
+            self.x_range = x_range
+        if y_range is not None:
+            self.y_range = y_range
+        if yaw_range is not None:
+            self.yaw_range = yaw_range
+
+    def update_approach_stop_value(self, x_approach_value=None, y_approach_value=None, yaw_approach_value=None):
+        if x_approach_value is not None:
+            self.x_approach_value = x_approach_value
+        if y_approach_value is not None:
+            self.y_approach_value = y_approach_value
+        if yaw_approach_value is not None:
+            self.yaw_approach_value = yaw_approach_value
+
+    def process(self, max_y, center_x, angle, x_stop, y_stop, yaw_stop, width, height):
+        y_stop = y_stop + self.calib_config['center_x_offset'] 
+        # 根据线的倾斜角度进行旋转调整
+        if abs(angle - yaw_stop) < 10:
+          yaw_output = misc.val_map(angle - yaw_stop, -8, 8, self.yaw_range[0], self.yaw_range[1])
+        else:
+          yaw_output = math.copysign(self.yaw_range[1], angle)
+        if abs(yaw_output) < 3:
+          yaw_output = math.copysign(3, angle)
+        if abs(angle) <= self.yaw_approach_value:
+          yaw_output = 0
+  
+          # print(angle, yaw_stop, yaw_output)
+        if abs(y_stop - center_x) < width / 8:
+          y_output = misc.val_map(y_stop - center_x, -width / 8, width / 8, self.y_range[0], self.y_range[1])
+        else:
+          y_output = math.copysign(self.y_range[1], y_stop - center_x)
+        if abs(y_output) < 0.005:
+          y_output = math.copysign(0.005, y_stop - center_x)
+        if abs(y_stop - center_x) <= self.y_approach_value:
+          y_output = 0
+  
+        if abs(max_y - x_stop) > height / 4:
+          x_output = math.copysign(self.x_range[1], x_stop - max_y)
+        elif abs(max_y - x_stop) <  height / 8:
+          x_output = math.copysign(0.005, x_stop - max_y)
+        else:
+          x_output = misc.val_map(x_stop - max_y, -height / 4, height / 4, self.x_range[0], self.x_range[1])
+        if abs(x_output) < 0.005:
+          x_output = math.copysign(0.005, x_stop - max_y)
+        if abs(x_stop - max_y) <= self.x_approach_value:
+          x_output = 0
+          
+        if abs(yaw_output) >= 5:
+          if x_output >= 0.01:
+            x_output = 0.01
+          else:
+            x_output = 0
+          
+          # print(x_output, y_output, yaw_output, center_x, max_y, angle)
+          # yaw_output, x_output = 0, 0
+          # print(abs(angle), abs(max_y - x_stop), abs(y_stop - center_x)) 
+        if self.debug:
+            print(center_x, max_y, angle, round(x_output, 4), round(y_output, 4), round(yaw_output, 2))
+        if x_output != 0 or y_output != 0 or yaw_output != 0:
+            self.count_stop = 0
+            self.gait_manager.set_step(self.dsp, round(x_output, 4), round(y_output, 4), -int(yaw_output), self.gait_param, arm_swap=self.arm_swap, step_num=self.step_mode)
+        else:
+            self.count_stop += 1
+            self.gait_manager.stop()  # 需要先关闭行走
+        self.stop_count += 1
+        # 完成判定 09-24 重写：原 `stop_count == 2` 是每被调用 2 次就无条件收工
+        # （与走没走到无关），导致跨栏接近全程只走约 2 步。现改为：
+        # 连续 2 次输出全零（对齐且距离到位）才收工，或 30 次封顶防死走。
+        if self.count_stop >= 2 or self.stop_count >= self.max_process_count:
+          self.stop_count = 0
+          print('approach finish')
+          return True
+        else:
+          return False
+        #else:
+            #return False

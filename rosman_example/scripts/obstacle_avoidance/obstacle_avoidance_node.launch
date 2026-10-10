@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<launch>
+    <include file="$(find rosman_kinematics)/launch/rosman_controller.launch"/>
+
+    <node pkg="rosman_example" type="obstacle_avoidance_node.py" name="kick_ball" output="screen"/>
+</launch>

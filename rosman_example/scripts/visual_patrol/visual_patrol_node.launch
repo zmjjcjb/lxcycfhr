@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<!--视觉巡线-->
+<launch>
+    <arg name="color"  default="black"/>
+    <arg name="start"  default="true"/>
+    <arg name="enable_display"  default="false"/>
+
+    <!--颜色识别节点-->
+    <include file="$(find rosman_example)/scripts/color_detection/color_detection_node.launch">
+        <arg name="enable_display"  value="$(arg enable_display)"/>
+    </include>
+
+    <include file="$(find rosman_bringup)/launch/base.launch"/>
+
+    <!--视觉巡线-->
+    <node pkg="rosman_example" type="visual_patrol_node.py" name="visual_patrol" output="screen">
+        <param name="start"  value="$(arg start)"/>
+        <param name="color"  value="$(arg color)"/>
+    </node>
+</launch>

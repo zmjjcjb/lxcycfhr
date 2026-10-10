@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--视觉巡线-->
+<launch>
+    <arg name="color"  default="white"/>
+    <arg name="start"  default="true"/>
+
+    <!--颜色识别节点-->
+    <include file="$(find rosman_example)/scripts/color_detection/color_detection_node.launch"/>
+
+    <!--步态控制节点-->
+    <include file="$(find rosman_kinematics)/launch/rosman_controller.launch"/>
+
+    <!--视觉巡线-->
+    <node pkg="rosman_example" type="footstep_node.py" name="footstep" output="screen">
+        <param name="start"  value="$(arg start)"/>
+        <param name="color"  value="$(arg color)"/>
+    </node>
+</launch>

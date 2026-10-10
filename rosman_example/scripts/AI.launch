@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!--巡线+颜色识别+步态控制-->
+<launch>
+    <arg name="start" default="true"/>
+
+    <!--颜色识别节点-->
+    <include file="$(find rosman_example)/scripts/color_detection/color_detection_node.launch"/>
+
+    <!--步态控制-->
+    <include file="$(find rosman_kinematics)/launch/rosman_controller.launch"/>
+
+    <!--巡线主节点-->
+    <node pkg="rosman_example" type="AI.py" name="combination" output="screen">
+        <param name="start" value="$(arg start)"/>
+    </node>
+</launch>

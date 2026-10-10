@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+# encoding: utf-8
+# @data:2023/07/06
+# @author:aiden
+# Line following logic processing(巡线逻辑处理)
+import math
+from rosman_sdk import misc, common
+
+class VisualPatrol:
+    def __init__(self, gait_manager):
+        self.calib_config = common.get_yaml_data('/home/ubuntu/ros_ws/src/rosman_example/config/calib.yaml')
+        self.x_range = [0, 0.014]  # The step length for walking forward in units of m(前进脚步大小单位m)[0,0.010]
+        self.yaw_range = [-8, 8]  # The turning range is between -8 and 8(转弯范围正负8度)
+        self.gait_manager = gait_manager
+        self.go_gait_param = self.gait_manager.get_gait_param()
+        self.go_gait_param['init_x_offset'] = -0.02
+        self.go_gait_param['body_height'] = 0.025
+        self.go_gait_param['step_height'] = 0.02#0.02
+        self.go_gait_param['init_y_offset'] = -0.002#-0.002
+        self.go_gait_param['hip_pitch_offset'] = 15
+        self.go_gait_param['z_swap_amplitude'] = 0.006#0.006
+        self.go_gait_param['y_swap_amplitude'] = 0.00#原本没有
+        self.go_gait_param['pelvis_offset'] = 3#原本没有
+        self.go_dsp = [500, 0.4, 0.02]
+        self.go_arm_swap = 30
+
+        self.turn_gait_param = self.gait_manager.get_gait_param()
+        self.turn_gait_param['init_x_offset'] = -0.02
+        self.turn_gait_param['body_height'] = 0.025
+        self.turn_gait_param['step_height'] = 0.015
+        self.turn_gait_param['init_y_offset'] = 0#-0.002
+        self.turn_gait_param['hip_pitch_offset'] = 15
+        self.turn_gait_param['z_swap_amplitude'] = 0.010
+        self.go_gait_param['y_swap_amplitude'] = 0.00#原本没有
+        self.go_gait_param['pelvis_offset'] = 3#原本没有
+        self.turn_dsp = [500, 0.4, 0.02]
+        self.turn_arm_swap = 30
+
+        self.x_max = self.x_range[1]
+
+    def update_turn_gait(self, dsp=None, x_max=None, arm_swap=None, walking_param=None):
+        if walking_param is not None:
+            self.turn_gait_param = walking_param
+        if dsp is not None:
+            self.turn_dsp = dsp
+        if x_max is not None:
+            self.x_max = x_max
+        if arm_swap is not None:
+            self.turn_arm_swap = arm_swap
+
+    def update_go_gait(self, dsp=None, x_max=None, arm_swap=None, walking_param=None):
+        if walking_param is not None:
+            self.go_gait_param = walking_param
+        if dsp is not None:
+            self.go_dsp = dsp
+        if x_max is not None:
+            self.x_max = x_max
+        if arm_swap is not None:
+            self.go_arm_swap = arm_swap
+
+    def process(self, x, width):
+        # Adjust left and right based on x-coordinate value(左右根据x坐标值进行调整)
+        #width=640
+        center_x = width/2 + self.calib_config['center_x_offset'] - 20
+        if abs(x - center_x) < 10:
+            yaw_output = 0
+        elif abs(x - center_x) < width/6:
+            yaw_output = math.copysign(1, x - center_x) + misc.val_map(x - center_x, -width/6, width/6, self.yaw_range[0] + 3, self.yaw_range[1] - 3)
+        elif abs(x - center_x) < width/4:
+            yaw_output = math.copysign(1, x - center_x) + misc.val_map(x - center_x, -width/4, width/4, self.yaw_range[0], self.yaw_range[1])
+        else:
+            yaw_output = math.copysign(self.yaw_range[1], x - center_x)
+        
+        # print(x, center_x, width/2, self.calib_config['center_x_offset'], yaw_output)
+        # print(x, center_x, yaw_output)
+        # When turning, decreases forward step length(转弯时前进步幅减小)
+        #print(yaw_output)
+        if abs(yaw_output) > 5: 
+            x_output = 0.008
+        else:
+            x_output = self.x_max
+        if abs(yaw_output) < 3:
+            self.gait_manager.set_step(self.go_dsp, x_output, 0, int(-yaw_output), self.go_gait_param, arm_swap=self.go_arm_swap, step_num=0)
+        else:
+            self.gait_manager.set_step(self.turn_dsp, x_output, 0, int(-yaw_output), self.turn_gait_param, arm_swap=self.turn_arm_swap, step_num=0)

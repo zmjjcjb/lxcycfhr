@@ -1,0 +1,102 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- ===================== 2026-09-23 改动：支持与 bringup 并行运行 =====================
+       机器人上 rosman_bringup/bringup.launch 常驻，已提供 /rosman_controller（步态）、
+       /camera（相机）、/color_detection（颜色识别）、/web_video_server 等。
+       按老师原版直接启动会重复拉起控制器/相机/颜色识别（同名节点抢占、双发
+       /object/pixel_coords），所以加三个开关，默认值 = 并行模式：
+         roslaunch rosman_iscc iscc_rosman_launch.launch
+       只额外启动 iscc 的 9 个任务节点 + 主控 + AprilTag 检测，底层全部复用 bringup。
+       独立运行（先停 bringup）时三个开关都给 true：
+         roslaunch rosman_iscc iscc_rosman_launch.launch enable_controller:=true \
+           enable_color_detection:=true enable_camera:=true
+       ================================================================================= -->
+  <!-- gait_switch: 步态使能总开关（true=允许运动控制输出，false=通常用于调试时禁止行走动作） -->
+  <arg name="gait_switch" default="true" />
+  <!-- 将 gait_switch 发布为全局参数，供控制与任务节点统一读取 -->
+  <param name="/gait_switch" value="$(arg gait_switch)" />
+
+  <!-- 底层控制器开关：并行模式默认 false（bringup 已在运行 rosman_controller） -->
+  <arg name="enable_controller" default="false" />
+  <!-- 颜色识别节点开关：并行模式默认 false（复用 bringup 的 /color_detection，两边节点同源） -->
+  <arg name="enable_color_detection" default="false" />
+  <!-- 相机开关：仅在 enable_color_detection 为 true 时有效 -->
+  <arg name="enable_camera" default="false" />
+  <!-- web_video_server 开关：仅在 enable_color_detection 为 true 时有效 -->
+  <arg name="enable_web_video" default="false" />
+
+  <!-- 底层控制器：包含机器人运动控制、动作执行等基础能力 -->
+  <group if="$(arg enable_controller)">
+    <include file="$(find rosman_kinematics)/launch/rosman_controller.launch" />
+  </group>
+
+  <!-- 视觉前端：颜色检测节点（可选摄像头/Web 视频推流/ROI 裁剪）
+       并行模式下整段跳过，直接使用 bringup 已启动的 /color_detection 节点 -->
+  <group if="$(arg enable_color_detection)">
+    <include file="$(find rosman_iscc)/launch/color_detection_node.launch">
+      <!-- true: 开启 ROI 检测（只在感兴趣区域做识别，减少误检/加速） -->
+      <arg name="enable_roi" value="true"/>
+
+      <!-- 相机与 web_video_server 由外层开关控制，避免与 bringup 抢设备 -->
+      <arg name="enable_camera" value="$(arg enable_camera)"/>
+
+      <!-- 开启后浏览器访问http://本机ip:8080/ 查看图像，例：http://192.168.149.1:8080/ -->
+      <arg name="enable_web_video" value="$(arg enable_web_video)"/>
+    </include>
+  </group>
+
+  <!-- AprilTag 连续检测：供橙色 A 入口触发、sandbag_throw 投掷前对齐，以及 green_return_place 终点找 Tag/对齐 -->
+  <include file="$(find apriltag_ros)/launch/continuous_detection.launch">
+    <arg name="camera_name" value="/camera"/>
+    <arg name="image_topic" value="image_rect_color"/>
+    <arg name="queue_size" value="10"/>
+  </include>
+  <!-- 用 ISCC 自己的 AprilTag 配置覆盖默认值，避免默认空 tags.yaml 导致无检测 -->
+  <param name="apriltag_ros_continuous_node/publish_tag_detections_image" value="false" />
+  <rosparam command="load" file="$(find rosman_iscc)/config/apriltag_settings.yaml" ns="apriltag_ros_continuous_node" />
+  <rosparam command="load" file="$(find rosman_iscc)/config/apriltag_tags.yaml" ns="apriltag_ros_continuous_node" />
+
+  <!-- 加载 ISCC 全部任务配置（阶段切换阈值、步态参数、颜色与 ROI 等） -->
+  <rosparam command="load" file="$(find rosman_iscc)/config/iscc_config.yaml" />
+
+  <!-- 主控状态机：负责阶段流转与任务节点启停（巡线/跨栏/台阶/橙线） -->
+  <node name="iscc_controller" pkg="rosman_iscc" type="iscc_controller.py"
+        output="screen" respawn="false" />
+
+  <!-- 白线巡线节点：执行基础巡线并在满足条件时由主控切换到后续任务 -->
+  <node name="line_following_node" pkg="rosman_iscc" type="line_following_node.py"
+        output="screen" respawn="false" />
+
+  <!-- 跨栏节点：识别蓝色栏杆并执行跨栏动作 -->
+  <node name="hurdles_node" pkg="rosman_iscc" type="hurdles_node.py"
+        output="screen" respawn="false" />
+
+  <!-- 上台阶节点：识别绿色台阶引导并执行上台阶动作 -->
+  <node name="climb_stairs_node" pkg="rosman_iscc" type="climb_stairs_node.py"
+        output="screen" respawn="false" />
+
+  <!-- 下台阶节点：识别绿色台阶引导并执行下台阶动作 -->
+  <node name="descend_stairs_node" pkg="rosman_iscc" type="descend_stairs_node.py"
+        output="screen" respawn="false" />
+
+  <!-- 橙线 A 阶段引导节点：完成从白线赛道向橙线走廊的过渡 -->
+  <node name="orange_guide_node" pkg="rosman_iscc" type="orange_guide_node.py"
+        output="screen" respawn="false" />
+
+  <!-- 橙线 B 阶段循迹节点：在橙色双线走廊内持续跟踪前进 -->
+  <node name="orange_line_follow_node" pkg="rosman_iscc" type="orange_line_follow_node.py"
+        output="screen" respawn="false" />
+
+  <!-- 丢沙包节点：由主控在 B 内紫色门控满足后启动，执行捡取、Tag 对齐、投掷和左转回轨 -->
+  <node name="sandbag_throw_node" pkg="rosman_iscc" type="sandbag_throw_node.py"
+        output="screen" respawn="false" />
+
+  <!-- 绿块抓取节点：二段 B 见绿达阈值后切入，执行目标对齐与抓取 -->
+  <node name="green_pick_node" pkg="rosman_iscc" type="green_pick_node.py"
+        output="screen" respawn="false" />
+
+  <!-- 绿块抓取后回程：右转找双橙线、循迹到 Tag、执行放块动作 -->
+  <node name="green_return_place_node" pkg="rosman_iscc" type="green_return_place_node.py"
+        output="screen" respawn="false" />
+
+</launch>

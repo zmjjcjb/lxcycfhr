@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!-- 颜色识别启动入口：可按开关决定是否拉起摄像头与网页视频流 -->
+<launch>
+    <!-- enable_camera: 是否启动 USB 摄像头节点（true=本机相机采图，false=使用外部已有图像话题） -->
+    <arg name="enable_camera"       default="true"/>
+    <!-- enable_web_video: 是否启动 web_video_server（便于浏览器查看图像流） -->
+    <arg name="enable_web_video"    default="true"/>
+    <!-- enable_roi: 是否启用 ROI 识别（仅在目标区域检测，降低噪声） -->
+    <arg name="enable_roi"          default="false"/>
+    <!-- node_name: 颜色识别节点名，便于多实例时区分 -->
+    <arg name="node_name"           default="color_detection"/>
+    <!-- debug: 调试开关（通常会输出更多日志/调试信息） -->
+    <arg name="debug"               default="false"/>
+    <!-- enable_display: 是否在本机显示处理画面（无图形界面环境建议关闭） -->
+    <arg name="enable_display"      default="false"/>
+    <!-- camera_name/image_topic: 摄像头命名空间及图像话题名 -->
+    <arg name="camera_name"         default="camera"/>
+    <arg name="image_topic"         default="image_rect_color"/>
+
+    <!-- 摄像头节点（可选）：从 USB 摄像头采图并发布到指定 image_topic -->
+    <include if="$(arg enable_camera)" file="$(find rosman_peripherals)/launch/usb_cam_with_calib.launch">
+        <arg name="camera_name" value="$(arg camera_name)"/>
+        <arg name="image_topic" value="$(arg image_topic)"/>
+    </include>
+
+    <!-- Web 图像服务（可选）：将 ROS 图像话题通过网页方式可视化 -->
+    <node if="$(arg enable_web_video)"  name="web_video_server" pkg="web_video_server" respawn="true" respawn_delay="2"  type="web_video_server" output="screen"/>
+
+    <!-- 颜色识别核心节点 -->
+    <node pkg="rosman_iscc" type="color_detection_node.py" name="$(arg node_name)" output="screen">
+        <!-- 调试模式 -->
+        <param name="debug"             value="$(arg debug)"/>
+        <!-- 是否显示结果画面 -->
+        <param name="enable_display"    value="$(arg enable_display)"/>
+        <!-- 是否启用 ROI 检测 -->
+        <param name="enable_roi"        value="$(arg enable_roi)"/>
+    </node>
+</launch>

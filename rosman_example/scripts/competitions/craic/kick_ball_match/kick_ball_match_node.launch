@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--自主踢球-->
+<launch>
+    <arg name="color"  default="blue"/>
+    <arg name="start"  default="true"/>
+
+    <!--颜色识别节点-->
+    <include file="$(find rosman_example)/scripts/color_detection/color_detection_node.launch"/>
+
+    <!--步态控制-->
+    <include file="$(find rosman_kinematics)/launch/rosman_controller.launch"/>
+
+    <!--自动踢球-->
+    <node pkg="rosman_example" type="kick_ball_match_node.py" name="kick_ball" output="screen">
+        <param name="start"  value="$(arg start)"/>
+        <param name="color"  value="$(arg color)"/>
+    </node>
+</launch>
